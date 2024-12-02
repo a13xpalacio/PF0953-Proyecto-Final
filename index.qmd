@@ -1,0 +1,546 @@
+---
+title: "PF0953 - Proyecto Final"
+author: "Alejandro Palacio Siebe"
+format: html
+editor: visual
+toc: true
+lang: es
+theme: flatly
+---
+
+## 1. Carga de bibliotecas
+
+```{r}
+#| label: carga-bibliotecas
+#| warning: false
+#| message: false
+#| code-fold: true
+
+library(tidyverse) # Colección de paquetes de Tidyverse
+library(ggthemes) # Estilos para ggplot2
+library(hrbrthemes)
+library(RColorBrewer) # Paletas de colores de RColorBrewer
+library(viridisLite) # Paletas de colores de viridis
+library(plotly) # Gráficos interactivos
+library(sf) # Manejo de datos vectoriales
+library(terra) # Manejo de datos raster
+library(raster) # Manejo de datos raster
+library(leaflet) # Mapas interactivos
+library(rgbif) # Acceso a datos en GBIF
+library(geodata) # Datos geoespaciales
+library(dismo) # Modelado de distribución de especies
+library(rJava) 
+```
+
+## 2. Parámetros generales
+
+```{r}
+#| label: parametros
+#| warning: false
+#| message: false
+
+# Nombre de la especie
+especie <- "Canis lupus baileyi"
+
+# Resolución espacial de los datos climáticos
+resolucion = 10
+
+# SSP
+ssp <- "585"
+
+# GCM
+gcm <- "HadGEM3-GC31-LL"
+
+# Proporción de datos de entreamiento a utilizar en el modelo
+proporcion_entrenamiento = 0.7
+
+# Umbral para mapa binario de distribución
+umbral <- 0.2
+```
+
+## 3. Obtención de datos de presencia
+
+```{r}
+#| label: datos-1
+#| warning: false
+#| message: false
+#| eval: true
+
+# Consultar el API de GBIF
+respuesta <- occ_search(
+  scientificName = especie, 
+  hasCoordinate = TRUE,
+  hasGeospatialIssue = FALSE,
+  limit = 3000
+)
+
+# Extraer datos de presencia
+presencia <- respuesta$data
+```
+
+```{r}
+#| label: csv-guardar
+#| warning: false
+#| message: false
+#| eval: true
+
+
+# Guardar los datos de presencia en un archivo CSV
+write_csv(presencia, 'presencia.csv')
+```
+
+```{r}
+#| label: csv-lectura
+#| warning: false
+#| message: false
+
+# Leer en un dataframe los datos de presencia de un archivo CSV
+presencia <- read_csv('presencia.csv')
+
+# Crear un objeto sf a partir del dataframe
+presencia <- st_as_sf(
+  presencia,
+  coords = c("decimalLongitude", "decimalLatitude"),
+  remove = FALSE, # conservar las columnas de las coordenadas
+  crs = 4326
+)
+```
+
+## 4. Delimitación del área de estudio
+
+```{r}
+#| label: datos-area-estudio
+#| warning: false
+#| message: false
+
+# Delimitar la extensión del área de estudio
+area_estudio <- ext(
+  min(presencia$decimalLongitude) - 20, 
+  max(presencia$decimalLongitude) + 20,
+  min(presencia$decimalLatitude) - 3, 
+  max(presencia$decimalLatitude) + 8
+)
+```
+
+## 5. Obtención de datos de clima actual
+
+```{r}
+#| label: datos-clima-actual
+#| warning: false
+#| message: false
+
+# Obtener datos climáticos actuales
+clima_actual <- worldclim_global(
+  var = 'bio', 
+  res = resolucion, 
+  path = tempdir()
+)
+
+# Recortar los datos climáticos para el área de estudio
+clima_actual <- crop(clima_actual, area_estudio)
+
+# Desplegar nombres de las variables climáticas
+names(clima_actual)
+```
+
+## 6. Obtención de datos de clima futuro
+
+```{r}
+#| label: datos-clima-futuro
+#| warning: false
+#| message: false
+
+# Obtener datos climáticos para escenario futuro
+clima_futuro <- cmip6_world(
+  var = "bioc",
+  res = resolucion,
+  ssp = ssp,
+  model = gcm,
+  time = "2041-2060",
+  path = tempdir()
+)
+
+# Recortar los datos climáticos para el área de estudio
+clima_futuro <- crop(clima_futuro, area_estudio)
+
+# Desplegar nombres de las variables
+names(clima_futuro)
+```
+
+## 7. Modelización
+
+```{r}
+#| label: modelizacion-1
+#| warning: false
+#| message: false
+
+# Crear dataframe con columnas de longitud y latitud
+coordenadas_presencia <- data.frame(
+  decimalLongitude = presencia$decimalLongitude,
+  decimalLatitude = presencia$decimalLatitude
+)
+
+# Eliminar coordenadas duplicadas
+coordenadas_presencia <- unique(coordenadas_presencia)
+```
+
+###### Dividir los datos de presencia en dos subconjuntos
+
+```{r}
+#| label: modelizacion-2
+#| warning: false
+#| message: false
+
+# Establecer una "semilla" para garantizar que la selección aleatoria sea reproducible
+set.seed(123)
+
+# Cantidad de registros de presencia
+n_presencia <- nrow(coordenadas_presencia)
+
+# Con sample(), se selecciona aleatoriamente una proporción (ej. 0.7) 
+# de los índices de los datos de presencia para el conjunto de entrenamiento
+indices_entrenamiento <- sample(
+  1:n_presencia, 
+  size = round(proporcion_entrenamiento * n_presencia)
+)
+
+# Crear el subconjunto de entrenamiento utilizando los índices seleccionados
+entrenamiento <- coordenadas_presencia[indices_entrenamiento, ]
+
+# Crear el subconjunto de evaluación con los datos restantes
+evaluacion <- coordenadas_presencia[-indices_entrenamiento, ]
+```
+
+### 7.1 Modelo con clima actual
+
+```{r}
+#| label: modelizacion-actual 
+#| warning: false
+#| message: false
+
+# Los datos de clima deben convertirse al formato que usa el paquete raster
+# debido a es este el que acepta el paquete dismo
+clima_actual <- raster::stack(clima_actual)
+
+# Generar el modelo
+modelo_actual <- maxent(x = clima_actual, p = entrenamiento)
+
+# Aplicar el modelo entrenado al clima actual
+prediccion_actual <- predict(modelo_actual, clima_actual)
+```
+
+#### 7.1.2 Evaluación modelo clima actual
+
+```{r}
+#| label: evaluacion-actual
+#| warning: false
+#| message: false
+
+# terra::extract() extrae los valores del raster de predicción 
+# en las coordenadas de evaluación
+# eval_pres almacena los valores de idoneidad predichos 
+# en los puntos de evaluación de presencia
+eval_pres <- terra::extract(
+  prediccion_actual, 
+  evaluacion[, c('decimalLongitude', 'decimalLatitude')]
+)
+
+# Generar puntos aleatorios dentro del Área de estudio definida. 
+# Estos puntos se asumen como ausencias de la especie.
+ausencias <- randomPoints(mask = clima_actual, n = 1000)
+
+# eval_aus almacena los valores de idoneidad predichos
+# en los puntos de ausencia
+eval_aus <- terra::extract(
+  prediccion_actual, 
+  ausencias
+)
+
+# Generar estadísticas de evaluación del modelo
+resultado_evaluacion <- evaluate(p = eval_pres, a = eval_aus)
+```
+
+#### 7.1.3 Curva ROC y AUC
+
+```{r}
+#| label: modelo-roc-auc
+#| warning: false
+#| message: false
+#| code-fold: true
+
+# Datos para graficar la curva ROC
+datos_roc <- data.frame(
+  FPR = resultado_evaluacion@FPR,
+  TPR = resultado_evaluacion@TPR,
+  Umbral = resultado_evaluacion@t
+)
+
+# Valor AUC
+auc <- resultado_evaluacion@auc
+
+# Gráfico ggplot2
+grafico_roc_ggplot2 <-
+  ggplot(
+    datos_roc, 
+    aes(
+      x = FPR, 
+      y = TPR,
+      u = Umbral
+    )
+  ) +
+  geom_line(
+    color = "#2CBAA9", 
+    size = 1
+  ) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey") +
+  labs(title = paste("Curva ROC (AUC =", round(auc, 3), ")"),
+       x = "Tasa de falsos positivos (FPR)",
+       y = "Tasa de verdaderos positivos (TPR)") +
+  theme_ipsum() +
+  theme(plot.title = element_text(size = 14))
+
+
+# Gráfico plotly
+ggplotly(grafico_roc_ggplot2) |> 
+  config(locale = 'es')
+```
+
+
+### 7.2 Modelo con clima futuro
+
+```{r}
+#| label: modelizacion-futuro
+#| warning: false
+#| message: false
+
+# Convertir variables climáticas futuras al formato raster stack
+clima_futuro_raster <- raster::stack(clima_futuro)
+
+# Asegurar que las variables tengan los mismos nombres y orden
+names(clima_futuro_raster) <- names(clima_actual)
+
+# Proyectar el modelo al clima futuro
+prediccion_futuro <- predict(modelo_actual, clima_futuro_raster)
+```
+
+### 7.3 Diferencia
+
+```{r}
+#| label: modelizacion-diferencia
+#| warning: false
+#| message: false
+
+# Calcular la diferencia
+diferencia <- prediccion_futuro - prediccion_actual
+```
+
+## 8. Mapas
+
+### 8.1 Mapa de idoneidad del hábitat
+
+```{r}
+#| label: mapa-1
+#| warning: false
+#| message: false
+#| code-fold: true
+
+# Paleta de colores del modelo con clima actual
+colores_modelo_actual <- colorNumeric(
+  palette = c("white", "black"),
+  values(prediccion_actual),
+  na.color = "transparent"
+)
+
+# Paleta de colores del modelo con clima futuro
+colores_modelo_futuro <- colorNumeric(
+  palette = c("white", "black"),
+  values(prediccion_futuro),
+  na.color = "transparent"
+)
+
+# Crear paleta de colores para la diferencia
+paleta_diferencia <- colorNumeric(
+  palette = c("orange", "white", "#2CBAA9"),
+  domain = c(min(values(diferencia), na.rm = TRUE), max(values(diferencia), na.rm = TRUE)),
+  na.color = "transparent"
+)
+
+# Mapa de la diferencia
+leaflet() |>
+  addTiles(group = "Mapa general") |>
+  addProviderTiles(
+    providers$Esri.WorldImagery, 
+    group = "Imágenes satelitales"
+  ) |>  
+  addProviderTiles(
+    providers$CartoDB.Positron, 
+    group = "Mapa blanco"
+  ) |>
+  addRasterImage(
+    prediccion_actual,
+    colors = colores_modelo_actual,
+    opacity = 0.6,
+    group = "Modelo con clima actual",
+  ) |>
+  addRasterImage(
+    prediccion_futuro,
+    colors = colores_modelo_futuro,
+    opacity = 0.6,
+    group = "Modelo con clima futuro",
+  ) |>  
+  addRasterImage(
+    diferencia,
+    colors = paleta_diferencia,
+    opacity = 0.6,
+    group = "Diferencia",
+  ) |>  
+  addLegend(
+    title = "Modelo con clima actual",
+    values = values(prediccion_actual),
+    pal = colores_modelo_actual,
+    position = "bottomleft",
+    group = "Modelo con clima actual"
+  ) |>    
+  addLegend(
+    title = "Modelo con clima futuro",
+    values = values(prediccion_futuro),
+    pal = colores_modelo_futuro,
+    position = "bottomright",
+    group = "Modelo con clima futuro"
+  ) |>     
+  addLegend(
+    title = "Diferencia",
+    values = values(diferencia),
+    pal = paleta_diferencia,
+    position = "bottomleft",
+    group = "Diferencia"
+  ) |>  
+  addLayersControl(
+    # control de capas
+    baseGroups = c("Mapa general", "Imágenes satelitales", "Mapa blanco"),
+    overlayGroups = c(
+      "Modelo con clima actual",
+      "Modelo con clima futuro",
+      "Diferencia"
+    )
+  ) |>
+  hideGroup("Modelo con clima actual") |>
+  hideGroup("Modelo con clima futuro")
+```
+
+### 8.2 Mapa binario de distribución
+
+```{r}
+#| label: mapa-2
+#| warning: false
+#| message: false
+#| code-fold: true
+
+# Crear el raster binario
+prediccion_binaria_actual <- (prediccion_actual >= umbral) * 1
+prediccion_binaria_futuro <- (prediccion_futuro >= umbral) *1
+prediccion_binaria_diferencia <- (diferencia >= umbral) *1
+
+# Crear la paleta de colores para el raster binario del modelo actual
+colores_prediccion_binaria_actual <- colorFactor(
+  palette = c("transparent", "#2CBAA9"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Crear la paleta de colores para el raster binario del modelo futuro
+colores_prediccion_binaria_futuro <- colorFactor(
+  palette = c("transparent", "orange"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Crear la paleta de colores para el raster binario del modelo diferencia
+colores_prediccion_binaria_diferencia <- colorFactor(
+  palette = c("transparent", "red"),  # "transparent" para las áreas no adecuadas
+  domain = c(0, 1),
+  na.color = "transparent"
+)
+
+# Mapa
+leaflet() |>
+  addTiles(group = "Mapa general") |>
+  addProviderTiles(
+    providers$Esri.WorldImagery, 
+    group = "Imágenes satelitales"
+  ) |>
+  addProviderTiles(
+    providers$CartoDB.Positron, 
+    group = "Mapa blanco"
+  ) |>
+  addRasterImage(
+    prediccion_binaria_actual,
+    colors = colores_prediccion_binaria_actual,
+    opacity = 0.6,
+    group = "Modelo actual de distribución binario",
+  ) |>
+  addRasterImage(
+    prediccion_binaria_futuro,
+    colors = colores_prediccion_binaria_futuro,
+    opacity = 0.6,
+    group = "Modelo futuro de distribución binario",
+  ) |>
+  addRasterImage(
+    prediccion_binaria_diferencia,
+    colors = colores_prediccion_binaria_diferencia,
+    opacity = 0.6,
+    group = "Modelo diferencia de distribución binario",  
+  ) |>
+  addCircleMarkers(
+    data = presencia,
+    stroke = FALSE,
+    radius = 3,
+    fillColor = 'grey',
+    fillOpacity = 1,
+    popup = paste(
+      paste0("<strong>País: </strong>", presencia$country),
+      paste0("<strong>Localidad: </strong>", presencia$locality),
+      paste0("<strong>Fecha: </strong>", presencia$eventDate),
+      paste0("<strong>Fuente: </strong>", presencia$institutionCode),
+      paste0("<a href='", presencia$occurrenceID, "'>Más información</a>"),
+      sep = '<br/>'
+    ),
+    group = "Registros de Canis lupus baileyi"
+  ) |>
+  addLegend(
+    title = "Modelo actual de distribución binario",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "#2CBAA9"),
+    position = "bottomleft",
+    group = "Modelo actual de distribución binario"
+  ) |>
+  addLegend(
+    title = "Modelo futuro de distribución binario",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "orange"),
+    position = "bottomleft",
+    group = "Modelo futuro de distribución binario"
+  ) |>
+  addLegend(
+    title = "Diferencia",
+    labels = c("Ausencia", "Presencia"),
+    colors = c("transparent", "red"),
+    position = "bottomleft",
+    group = "Diferencia"
+  ) |>
+  addLayersControl(
+    baseGroups = c("Mapa general", "Imágenes satelitales", "Mapa blanco"),
+    overlayGroups = c(
+      "Modelo actual de distribución binario", 
+      "Modelo futuro de distribución binario",
+      "Diferencia",
+      "Registros de Canis lupus baileyi"
+    )
+  ) |> 
+  hideGroup("Modelo actual de distribución binario") |>
+  hideGroup("Modelo futuro de distribución binario")
+```
+
+## 9. Comentario
+
+###### El modelo de nichos ecológicos arroja un valor de AUC muy cercano a 1, por lo que indica una tasa alta de verdaderos positivos y una tasa baja de falsos negativos, por lo cual se puede considerar como un buen modelo de clasificación. El modelo, bajo el escenario SSP5-8-.5 de altas emisones, demuestra una fuerte disminución del hábitat idóneo de la especie Canis Lupus Baileyi, sugiriendo que la especie podría desaparecer bajo estas condiciones. Por este motivo y con la finalidad de visualizar mejor los cambios en el mapa binario de distribución, se eligió un umbral bajo para identificar las zonas que, a pesar de contar con bajas probabilidades de ocurrir, podrían potencialmente albergar a esta especie a pesar de los cambios climáticos proyectados. Sin embargo, esta probabilidad es baja y poco fiable dado el umbral bajo. De usarse un umbral más alto, el mapa no mostraría posibilidades de presencia, lo que sugiere una alta probabilidad de desaparición de la especie en el futuro bajo este escenario de emisiones. 
